@@ -1,0 +1,354 @@
+
+
+
+import sys
+sys.path.append('/Users/rezaie/github/FFTLog-and-beyond/python')
+sys.path.append('/Users/rezaie/github/LSSutils')
+
+import healpy as hp
+import numpy as np
+from fftlog import fftlog
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from scipy.integrate import romberg, simps
+import pyccl as ccl
+# from tqdm import tqdm
+
+from lssutils.utils import histogram_cell, mask2regions
+from lssutils.stats.cl import AnaFast, cl2xi, xi2cl, gauleg
+
+def read_weight_mask():
+    
+    mask_ = hp.read_map('/Volumes/TimeMachine/data/DR7/mask.cut.hp.256.fits', verbose=False) > 0
+    mask = mask2regions(mask_)[0] # NGC
+    return mask*1.0, mask
+    
+
+def read_mocks(case, return_cov=False):
+    # data
+    cl_mocks = np.load('cl_mocks_1k.npz', allow_pickle=True)
+    #print(cl_mocks.files)
+    cl_full = cl_mocks[case] # select full sky mocks
+
+    # bin measurements
+    #bins = #np.arange(2, 501, 6)
+    bins = np.array([2+i*2 for i in range(10)] + [2**i for i in range(5, 10)])
+
+    cl_fullb = []
+    for i in range(cl_full.shape[0]):
+
+        x, clb_ =  histogram_cell(cl_full[i, :], bins=bins)
+
+        cl_fullb.append(clb_)
+        #print('.', end='')
+    cl_fullb = np.array(cl_fullb)
+
+    y = cl_fullb.mean(axis=0)
+
+    nmocks, nbins = cl_fullb.shape
+    hf = (nmocks - 1.0)/(nmocks - nbins - 2.0)
+
+    cov = np.cov(cl_fullb, rowvar=False)*hf
+    invcov = np.linalg.inv(cov)
+    x = x.astype('int')
+    print(f'bins: {x}')
+    ret = (x, y, invcov)
+    if return_cov:
+        ret += (cov, )
+        
+    return ret
+
+
+def run_ccl(cosmo, dndz, bias, ell, has_rsd=False):
+    """ Run CCL angular power spectrum
+    
+    """
+    clu1 = ccl.NumberCountsTracer(cosmo, has_rsd=has_rsd, dndz=dndz, bias=bias, )
+    return ccl.angular_cl(cosmo, clu1, clu1, ell) #Clustering    
+
+def init_cosmology():    
+    _h = 0.6777
+    _Ob0 = 0.048206
+    _Ocdm0 = 0.307115 - _Ob0
+    _ns = 0.9611
+    _Tcmb = 2.7255
+    _sigma8 = 0.8225
+
+    cosmo = ccl.Cosmology(Omega_c=_Ocdm0, Omega_b=_Ob0, h=_h, 
+                          n_s=_ns, sigma8=_sigma8,
+                          T_CMB=_Tcmb, transfer_function='boltzmann_camb', 
+                          matter_power_spectrum='linear')            
+    return cosmo
+
+
+def plot_sample(z, dNdz, b):
+    plt.plot(z, dNdz)
+    plt.xlabel('z')
+    plt.ylabel('dN/dz')
+    plt.twinx()
+    plt.plot(z, b, 'C1--')
+    plt.ylabel('b')    
+
+def init_sample(kind='mock', verb=False):
+    """ Define a mock N(z), credit: DESC CCL
+
+    """
+    if kind == 'mock':        
+        z = np.arange(0.0, 3.0, 0.001)
+        i_lim = 26.                          # Limiting i-band magnitude
+        z0 = 0.0417*i_lim - 0.744
+        
+        Ngal = 46. * 100.31 * (i_lim - 25.)            # Normalisation, galaxies/arcmin^2
+        pz = 1./(2.*z0) * (z / z0)**2. * np.exp(-z/z0)  # Redshift distribution, p(z)
+        dNdz = Ngal * pz                               # Number density distribution
+        b = 1.5*np.ones(z.size)                        # Galaxy bias (constant with scale and z)
+    else:
+        from scipy.ndimage import gaussian_filter1d
+        z, dNdz_ = np.loadtxt('./nbar_eBOSS_QSO_NGC_v7_2.dat', usecols=(0, 3), unpack=True)
+        dNdz_[z < 0.05] = 0.0
+        b = 1.5*np.ones(dNdz_.size)
+        dNdz = gaussian_filter1d(dNdz_, 10.0)
+
+    if verb:plot_sample(z, dNdz, b)
+    
+    return z, b, dNdz
+
+
+class WindowSHT:
+    
+    def __init__(self, weight, mask, ell_ob, ngauss=2**12):
+        af = AnaFast()
+        cl_ = af(mask*1.0, weight, mask)        
+        
+        xi_zero = (cl_['cl']*(2.*cl_['l']+1.)).sum() / (4.*np.pi)
+
+        self.ell_ob = ell_ob
+        self.ell = cl_['l']
+        self.lmax = self.ell.max()
+        self.twol4pi = (2.*self.ell+1.)/(4.*np.pi)
+        self.twopi = 2.*np.pi
+
+        self.x, self.w = gauleg(ngauss)
+        self.xi_mask = self.cl2xi(cl_['cl']) / xi_zero
+        
+        print(f"lmax: {self.lmax}")
+        
+        self.Pl = []
+        for ell in self.ell_ob:
+            self.Pl.append(np.polynomial.Legendre.basis(ell)(self.x))
+        
+
+    def convolve(self, cl_model):
+        
+        xi_th = self.cl2xi(cl_model)
+        xi_thw = xi_th * self.xi_mask
+        cl_thw = self.xi2cl(xi_thw)        
+        
+        return cl_thw
+
+    def xi2cl(self, xi):
+        '''
+            calculates Cell from omega
+        '''
+        cl  = []
+        xiw = xi*self.w
+        for i in range(len(self.Pl)):
+            cl.append((xiw * self.Pl[i]).sum())
+            
+        return self.twopi*np.array(cl)
+
+    def cl2xi(self, cell):
+        '''
+            calculates omega from Cell at Cos(theta)
+        '''
+        return np.polynomial.legendre.legval(self.x, c=self.twol4pi*cell, tensor=False)
+    
+    
+class Posterior:
+    """ Log Posterior for PNGModel
+    """
+    def __init__(self, model):
+        self.model = model
+        
+    def logprior(self, theta):
+        ''' The natural logarithm of the prior probability. '''
+        lp = 0.
+        # unpack the model parameters from the tuple
+        fnl = theta
+        # uniform prior on fNL
+        fmin = -1000. # lower range of prior
+        fmax = 1000.  # upper range of prior
+        # set prior to 1 (log prior to 0) if in the range and zero (-inf) outside the range
+        lp = 0. if fmin < fnl < fmax else -np.inf
+        ## Gaussian prior on ?
+        #mmu = 3.     # mean of the Gaussian prior
+        #msigma = 10. # standard deviation of the Gaussian prior
+        #lp -= 0.5*((m - mmu)/msigma)**2
+
+        return lp
+
+    def loglike(self, theta, y, invcov, x):
+        '''The natural logarithm of the likelihood.'''
+        # unpack the model parameters
+        fnl = theta
+        # evaluate the model
+        md = self.model(x, fnl=fnl)
+        # return the log likelihood
+        return -0.5 * (y-md).dot(invcov.dot(y-md))
+
+    def logpost(self, theta, y, invcov, x):
+        '''The natural logarithm of the posterior.'''
+        return self.logprior(theta) + self.loglike(theta, y, invcov, x)
+    
+
+class PNGModel:
+    """
+    
+    **See Fang et al (2019); arXiv:1911.11947**
+    
+    """
+        
+    def __init__(self, cosmo, zref=0.0, has_rsd=False, has_fnl=False):
+        """
+        
+        
+        E.g.:
+            _h = 0.6777
+            _Ob0 = 0.048206
+            _Ocdm0 = 0.307115 - _Ob0
+            _ns = 0.9611
+            _Tcmb = 2.7255
+            _sigma8 = 0.8225
+            
+            cosmo = ccl.Cosmology(Omega_c=_Ocdm0, Omega_b=_Ob0, h=_h, 
+                                  n_s=_ns, sigma8=_sigma8,
+                                  T_CMB=_Tcmb, transfer_function='boltzmann_camb', 
+                                  matter_power_spectrum='linear')        
+        
+            th = Model(cosmo)
+            z = np.linspace(0., 3.)
+            k = np.logspace(-3, 0)
+            fig, ax = plt.subplots(ncols=3, figsize=(12, 3))
+            
+            ax[0].loglog(k, th.pk(k))
+            ax[1].plot(z, th.z2r(z))
+            ax[2].plot(z, th.d(z))
+            
+        """
+        msg = ("NOTE: This code uses a cosmology calculator that returns k"
+              " and P(k) in units of 1/Mpc and Mpc^3.\n Therefore, "
+              "the coefficient alpha in the model uses H_0 = 100h, not H_0=100.")
+        print(msg)
+
+        self.has_rsd = has_rsd
+        self.has_fnl = has_fnl
+        a = 1./(1.+zref)        
+        self.Omega_M = cosmo.cosmo.params.Omega_c+cosmo.cosmo.params.Omega_b
+        
+        # note that k is in unit of Mpc^-1
+        self.H0c = (cosmo.cosmo.params.h/ccl.physical_constants.CLIGHT_HMPC)
+        self.delta_c = 1.686 # spherical collapse overdensity
+        self.coef_fnl = 3*self.delta_c*self.Omega_M*self.H0c**2        
+                    
+        self.pk = lambda k:ccl.linear_matter_power(cosmo, k, a)
+        self.z2r = lambda z:ccl.comoving_radial_distance(cosmo, 1./(1.+z)) # (1+z) D_A(z)
+        self.d = lambda z:ccl.growth_factor(cosmo, 1./(1.+z)) # normalized to 1 at z=0
+        self.f = lambda z:ccl.growth_rate(cosmo, 1./(1.+z))
+        self.h = lambda z:ccl.h_over_h0(cosmo, 1./(1.+z))
+        
+        self.kernels_ready = False
+
+    def __call__(self, ell, fnl=0.0, **kwargs):
+
+        if not self.kernels_ready:
+            print('will create windows')
+            self.__make_kernels(ell, **kwargs)
+        elif not np.array_equal(ell, self.ell):
+            print('will update windows')            
+            self.__make_kernels(ell, **kwargs)
+                       
+        return self.__integrate_dk(fnl)
+
+    def add_tracer(self, z, b, nz, p=1.0):
+        self.p = p
+        intrp_kw = dict(fill_value=0.0, bounds_error=False)
+
+        # dz/dr
+        nh_spl = interp1d(self.z2r(z), nz*self.h(z), **intrp_kw) 
+        nh_tot = romberg(nh_spl, self.z2r(z.min()), self.z2r(z.max()), divmax=1000)
+
+        # bias
+        b_spl = interp1d(self.z2r(z), b, **intrp_kw)
+
+        # growth
+        d_spl = interp1d(self.z2r(z), self.d(z), **intrp_kw)
+
+        # growth rate: f = dlnD/dlna
+        f_spl = interp1d(self.z2r(z), self.f(z), **intrp_kw)
+
+        self.fr_wk = lambda r:r * b_spl(r) * d_spl(r) * (nh_spl(r)/nh_tot)  # W_ell: r*b*(D(r)/D(0))*dN/dr         
+        self.fr_wrk = lambda r:r * f_spl(r) * d_spl(r) * (nh_spl(r)/nh_tot) # Wr_ell:r*f*(D(r)/D(0))*dN/dr
+        self.fr_wkfnl = lambda r: r * (b_spl(r)-self.p) * (nh_spl(r)/nh_tot)     # Wfnl_ell:r*(b-p)*dN/dr            
+        
+
+    
+    def __make_kernels(self, ell, rmin=-10., rmax=10., num=1000):
+        assert (ell[1:] > ell[:-1]).all(), "ell must be increasing"
+        #assert (ell.min() > 1), "RSD requires ell > 2"
+        
+        r = np.logspace(rmin, rmax, num=num) # k = (ell+0.5) / r
+        
+        # w_ell(k)
+        fr = self.fr_wk(r)
+        fftl1 = fftlog(r, fr, nu=1.01)
+        self.wk = []
+        for ell_ in ell:
+            kwk_ = fftl1.fftlog(ell_)        
+            self.wk.append(kwk_)
+             
+        # wr_ell(k)        
+        fr = self.fr_wrk(r)
+        fftl2 = fftlog(r, fr, nu=1.01)
+        self.wrk = []
+        for ell_ in ell:
+            kwk_ = fftl2.fftlog_ddj(ell_)
+            self.wrk.append(kwk_)                
+
+        # wfnl_ell(k)
+        fr = self.fr_wkfnl(r)
+        fftl3 = fftlog(r, fr, nu=1.01)
+        self.wfnlk = []
+        for ell_ in ell:
+            kwk_ = fftl3.fftlog(ell_)
+            self.wfnlk.append(kwk_)
+            
+        self.ell = ell    
+        self.kernels_ready = True
+        
+    def __integrate_dk(self, fnl):
+        
+        res = []
+        #for i in tqdm(range(len(self.wk))):
+        for i in range(len(self.wk)):
+            k_, wk_ = self.wk[i]
+            wk_t = wk_*1.0
+            
+            if self.has_rsd:
+                _, wrk_ = self.wrk[i]
+                wk_t -= wrk_
+
+            if self.has_fnl:
+                _, wrk_ = self.wfnlk[i]
+                wk_t += self.coef_fnl*fnl*wrk_/(k_*k_) # fnl ~ 1/k^2
+            
+            lnk = np.log(k_)
+            intg = k_*k_*k_*self.pk(k_)*wk_t*wk_t            
+            cl_ = simps(intg, x=lnk)
+            res.append(cl_)       
+
+        return (2./np.pi)*np.array(res)        
+        
+        
+#     def savetxt(self, filename):
+#         el_ = np.arange(self.cl.size)
+#         np.savetxt(filename, np.column_stack([el_, self.cl]), fmt='%d %.15f')
