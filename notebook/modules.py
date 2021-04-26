@@ -10,7 +10,8 @@ import numpy as np
 from fftlog import fftlog
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
-from scipy.integrate import romberg, simps
+from scipy.integrate import romberg, simps, quad
+
 import pyccl as ccl
 # from tqdm import tqdm
 
@@ -19,14 +20,21 @@ from lssutils.stats.cl import AnaFast, cl2xi, xi2cl, gauleg
 
 def read_weight_mask():
     
-    mask_ = hp.read_map('/Volumes/TimeMachine/data/DR7/mask.cut.hp.256.fits', verbose=False) > 0
-    mask = mask2regions(mask_)[0] # NGC
-    return mask*1.0, mask
+    #mask_ = hp.read_map('/Volumes/TimeMachine/data/DR7/mask.cut.hp.256.fits', dtype=np.float32, verbose=False) > 0
+    #mask = mask2regions(mask_)[0] # NGC
+    
+    # read mask
+    mask = hp.read_map('/Volumes/TimeMachine/data/DR9fnl/north_mask_hp256.hp.fits', dtype=np.float64) > 0.0
+    
+    maskf = np.ones_like(mask)
+    weight = maskf * 1.0        # all sky is the same
+    
+    return weight, mask
     
 
 def read_mocks(case, return_cov=False):
     # data
-    cl_mocks = np.load('cl_mocks_1k.npz', allow_pickle=True)
+    cl_mocks = np.load('cl_mocks_2k_qso.npz', allow_pickle=True)
     #print(cl_mocks.files)
     cl_full = cl_mocks[case] # select full sky mocks
 
@@ -51,12 +59,22 @@ def read_mocks(case, return_cov=False):
     cov = np.cov(cl_fullb, rowvar=False)*hf
     invcov = np.linalg.inv(cov)
     x = x.astype('int')
-    print(f'bins: {x}')
+    print(f'bins: {x}, nmocks: {nmocks}, nbins: {nbins}')
     ret = (x, y, invcov)
     if return_cov:
         ret += (cov, )
         
     return ret
+
+def read_datacl(kind='after'):
+    cl_data = np.load('/Volumes/TimeMachine/data/DR9fnl/cl_qso_north_rf.npz', allow_pickle=True)
+    shotnoise = 1.017379567874895e-06
+    
+    cl_obs = cl_data[f'cl_{kind}']-shotnoise
+    el_obs = np.arange(cl_obs.size)
+    bins = np.array([2+i*2 for i in range(10)] + [2**i for i in range(5, 10)])
+    elb, clb = histogram_cell(cl_obs, bins=bins)
+    return elb, clb
 
 
 def run_ccl(cosmo, dndz, bias, ell, has_rsd=False):
@@ -102,18 +120,43 @@ def init_sample(kind='mock', verb=False):
         pz = 1./(2.*z0) * (z / z0)**2. * np.exp(-z/z0)  # Redshift distribution, p(z)
         dNdz = Ngal * pz                               # Number density distribution
         b = 1.5*np.ones(z.size)                        # Galaxy bias (constant with scale and z)
-    else:
+        
+    elif kind == 'eboss':
         from scipy.ndimage import gaussian_filter1d
         z, dNdz_ = np.loadtxt('./nbar_eBOSS_QSO_NGC_v7_2.dat', usecols=(0, 3), unpack=True)
         dNdz_[z < 0.05] = 0.0
         b = 1.5*np.ones(dNdz_.size)
         dNdz = gaussian_filter1d(dNdz_, 10.0)
+        
+    elif kind == 'qsomock':
+        z, dNdz = np.loadtxt('/Volumes/TimeMachine/data/DR9fnl/nz_qso_rf.txt').T   # ext=0
+        b = 2.5*np.ones_like(z)
+        
+    else:
+        raise RuntimeError(f"{kind} not supported.")
+        
 
     if verb:plot_sample(z, dNdz, b)
     
     return z, b, dNdz
 
 
+class WindowRR:
+    def __init__(self, rr_file, ntot, npix):
+        
+        area = ntot / npix
+        
+        raw_data = np.load(rr_file, allow_pickle=True)
+        sep = raw_data[0][::-1]           # in radians
+        rr_counts = raw_data[1][::-1]*2.0 # paircount uses symmetry
+
+        sep_mid = 0.5*(sep[1:]+sep[:-1])
+        dsep = np.diff(sep)        
+        window = rr_counts / (dsep*np.sin(sep_mid)) * (2./(npix*npix*area))
+        
+        self.window_spl = interp1d(np.cos(sep_mid), window, fill_value="extrapolate")
+
+        
 class WindowSHT:
     
     def __init__(self, weight, mask, ell_ob, ngauss=2**12):
@@ -123,24 +166,36 @@ class WindowSHT:
         xi_zero = (cl_['cl']*(2.*cl_['l']+1.)).sum() / (4.*np.pi)
 
         self.ell_ob = ell_ob
-        self.ell = cl_['l']
-        self.lmax = self.ell.max()
-        self.twol4pi = (2.*self.ell+1.)/(4.*np.pi)
         self.twopi = 2.*np.pi
 
         self.x, self.w = gauleg(ngauss)
-        self.xi_mask = self.cl2xi(cl_['cl']) / xi_zero
-        
-        print(f"lmax: {self.lmax}")
-        
+        self.xi_mask = self.cl2xi(cl_['l'], cl_['cl']) / xi_zero
+                
         self.Pl = []
         for ell in self.ell_ob:
             self.Pl.append(np.polynomial.Legendre.basis(ell)(self.x))
+      
+    def read_rr(self, rr_file, ntot, npix):
         
+        area = ntot / npix
+        
+        raw_data = np.load(rr_file, allow_pickle=True)
+        sep = raw_data[0][::-1]           # in radians
+        rr_counts = raw_data[1][::-1]*2.0 # paircount uses symmetry
 
-    def convolve(self, cl_model):
+        sep_mid = 0.5*(sep[1:]+sep[:-1])
+        dsep = np.diff(sep)        
+        window = rr_counts / (dsep*np.sin(sep_mid)) * (2./(npix*npix*area))   
+        self.window_spl = interp1d(np.cos(sep_mid), window, fill_value="extrapolate")
+
+        small_scale = self.x < -0.5735764363510458 # i.e., cos(x) < cos(125)
+        self.xi_mask = self.xi_mask_ * 1.0
+        self.xi_mask[small_scale] = self.window_spl(self.x[small_scale])
+    
+
+    def convolve(self, el_model, cl_model):
         
-        xi_th = self.cl2xi(cl_model)
+        xi_th = self.cl2xi(el_model, cl_model)
         xi_thw = xi_th * self.xi_mask
         cl_thw = self.xi2cl(xi_thw)        
         
@@ -157,11 +212,12 @@ class WindowSHT:
             
         return self.twopi*np.array(cl)
 
-    def cl2xi(self, cell):
+    def cl2xi(self, ell, cell):
         '''
             calculates omega from Cell at Cos(theta)
         '''
-        return np.polynomial.legendre.legval(self.x, c=self.twol4pi*cell, tensor=False)
+        twol4pi = (2.*ell+1.)/(4.*np.pi)
+        return np.polynomial.legendre.legval(self.x, c=twol4pi*cell, tensor=False)
     
     
 class Posterior:
@@ -201,6 +257,24 @@ class Posterior:
         return self.logprior(theta) + self.loglike(theta, y, invcov, x)
     
 
+class NoZ:
+    
+    def __init__(self, 
+                 filename,
+                 kind=1,
+                 zmin=0.0,
+                 zmax=5.0, 
+                 fill_value='extrapolate'):
+        
+        self.nz_, self.z_ = np.loadtxt(filename).T
+        
+        nz_spl = interp1d(self.z_, self.nz_, kind=kind, fill_value=fill_value, 
+                          bounds_error=False) # extrapolate
+        #nz_spl.set_smoothing_factor(smfactor)
+                
+        self.nz_norm = romberg(nz_spl, zmin, zmax, divmax=1000)        
+        self.nz_fn = lambda z:nz_spl(z)/self.nz_norm        
+        
 class PNGModel:
     """
     
@@ -286,9 +360,9 @@ class PNGModel:
         # growth rate: f = dlnD/dlna
         f_spl = interp1d(self.z2r(z), self.f(z), **intrp_kw)
 
-        self.fr_wk = lambda r:r * b_spl(r) * d_spl(r) * (nh_spl(r)/nh_tot)  # W_ell: r*b*(D(r)/D(0))*dN/dr         
-        self.fr_wrk = lambda r:r * f_spl(r) * d_spl(r) * (nh_spl(r)/nh_tot) # Wr_ell:r*f*(D(r)/D(0))*dN/dr
-        self.fr_wkfnl = lambda r: r * (b_spl(r)-self.p) * (nh_spl(r)/nh_tot)     # Wfnl_ell:r*(b-p)*dN/dr            
+        self.fr_wk = lambda r:r * b_spl(r) * d_spl(r) * (nh_spl(r)/nh_tot)   # W_ell: r*b*(D(r)/D(0))*dN/dr         
+        self.fr_wrk = lambda r:r * f_spl(r) * d_spl(r) * (nh_spl(r)/nh_tot)  # Wr_ell:r*f*(D(r)/D(0))*dN/dr
+        self.fr_wkfnl = lambda r: r * (b_spl(r)-self.p) * (nh_spl(r)/nh_tot) # Wfnl_ell:r*(b-p)*dN/dr            
         
 
     
@@ -346,7 +420,11 @@ class PNGModel:
             cl_ = simps(intg, x=lnk)
             res.append(cl_)       
 
-        return (2./np.pi)*np.array(res)        
+        cls = (2./np.pi)*np.array(res)
+        if self.ell[0] == 0:
+            cls[0] = 0.0
+        #cls[1] = 0.0
+        return cls
         
         
 #     def savetxt(self, filename):
