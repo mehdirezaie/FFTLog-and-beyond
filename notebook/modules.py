@@ -17,7 +17,29 @@ import pyccl as ccl
 
 from lssutils.utils import histogram_cell, mask2regions
 from lssutils.stats.cl import AnaFast, cl2xi, xi2cl, gauleg
+from lssutils.dataviz import setup_color
 
+
+class NoZ:
+    
+    def __init__(self, 
+                 filename,
+                 k=3,
+                 zmin=0.0,
+                 zmax=5.0, 
+                 fill_value='extrapolate'):
+        
+        self.nz_, self.z_ = np.loadtxt(filename).T
+        
+        nz_spl = interp1d(self.z_, self.nz_, kind=k, fill_value=fill_value, 
+                          bounds_error=False) # extrapolate
+        #nz_spl.set_smoothing_factor(smfactor)
+                
+        self.nz_norm = romberg(nz_spl, zmin, zmax, divmax=1000)        
+        self.nz_fn = lambda z:nz_spl(z)/self.nz_norm        
+        
+        
+        
 def read_weight_mask():
     
     #mask_ = hp.read_map('/Volumes/TimeMachine/data/DR7/mask.cut.hp.256.fits', dtype=np.float32, verbose=False) > 0
@@ -107,11 +129,11 @@ def plot_sample(z, dNdz, b):
     plt.plot(z, b, 'C1--')
     plt.ylabel('b')    
 
-def init_sample(kind='mock', verb=False):
+def init_sample(kind='mock', verb=False, **kw):
     """ Define a mock N(z), credit: DESC CCL
 
     """
-    if kind == 'mock':        
+    if kind == 'mock':             
         z = np.arange(0.0, 3.0, 0.001)
         i_lim = 26.                          # Limiting i-band magnitude
         z0 = 0.0417*i_lim - 0.744
@@ -122,6 +144,7 @@ def init_sample(kind='mock', verb=False):
         b = 1.5*np.ones(z.size)                        # Galaxy bias (constant with scale and z)
         
     elif kind == 'eboss':
+        
         from scipy.ndimage import gaussian_filter1d
         z, dNdz_ = np.loadtxt('./nbar_eBOSS_QSO_NGC_v7_2.dat', usecols=(0, 3), unpack=True)
         dNdz_[z < 0.05] = 0.0
@@ -129,7 +152,10 @@ def init_sample(kind='mock', verb=False):
         dNdz = gaussian_filter1d(dNdz_, 10.0)
         
     elif kind == 'qsomock':
-        z, dNdz = np.loadtxt('/Volumes/TimeMachine/data/DR9fnl/nz_qso_rf.txt').T   # ext=0
+        
+        nz = NoZ('/Volumes/TimeMachine/data/DR9fnl/FOR_MEDHI/RF_g.txt', **kw)
+        z = np.arange(0.0, 5.0, 0.02)
+        dNdz = nz.nz_fn(z)
         b = 2.5*np.ones_like(z)
         
     else:
@@ -257,24 +283,6 @@ class Posterior:
         return self.logprior(theta) + self.loglike(theta, y, invcov, x)
     
 
-class NoZ:
-    
-    def __init__(self, 
-                 filename,
-                 kind=1,
-                 zmin=0.0,
-                 zmax=5.0, 
-                 fill_value='extrapolate'):
-        
-        self.nz_, self.z_ = np.loadtxt(filename).T
-        
-        nz_spl = interp1d(self.z_, self.nz_, kind=kind, fill_value=fill_value, 
-                          bounds_error=False) # extrapolate
-        #nz_spl.set_smoothing_factor(smfactor)
-                
-        self.nz_norm = romberg(nz_spl, zmin, zmax, divmax=1000)        
-        self.nz_fn = lambda z:nz_spl(z)/self.nz_norm        
-        
 class PNGModel:
     """
     
