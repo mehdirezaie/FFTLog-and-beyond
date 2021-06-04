@@ -22,7 +22,8 @@ fr = r
 nu = 1.01
 ell = 0
 
-myfftlog = fftlog(r, fr, nu=nu, N_extrap_low=1500, N_extrap_high=1500, c_window_width=0.25, N_pad=5000)
+myfftlog = fftlog(r, fr, nu=nu, N_extrap_low=1500, 
+                  N_extrap_high=1500, c_window_width=0.25, N_pad=5000)
 
 k, Fk = myfftlog.fftlog(ell)
 Fk_true = np.pi / (2*k)

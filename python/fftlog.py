@@ -128,15 +128,15 @@ class hankel(object):
 
 def log_extrap(x, N_extrap_low, N_extrap_high):
 
-	low_x = high_x = []
-	if(N_extrap_low):
-		dlnx_low = np.log(x[1]/x[0])
-		low_x = x[0] * np.exp(dlnx_low * np.arange(-N_extrap_low, 0) )
-	if(N_extrap_high):
-		dlnx_high= np.log(x[-1]/x[-2])
-		high_x = x[-1] * np.exp(dlnx_high * np.arange(1, N_extrap_high+1) )
-	x_extrap = np.hstack((low_x, x, high_x))
-	return x_extrap
+    low_x = high_x = []
+    if(N_extrap_low):
+        dlnx_low = np.log(x[1]/x[0])
+        low_x = x[0] * np.exp(dlnx_low * np.arange(-N_extrap_low, 0) )
+    if(N_extrap_high):
+        dlnx_high= np.log(x[-1]/x[-2])
+        high_x = x[-1] * np.exp(dlnx_high * np.arange(1, N_extrap_high+1) )
+    x_extrap = np.hstack((low_x, x, high_x))
+    return x_extrap
 
 def c_window(n,n_cut):
 	"""
