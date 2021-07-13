@@ -39,6 +39,20 @@ def dNdz_model(sample='qso', z_low=0.1, kind=1):
         # plt.semilogy()
         # plt.ylim(1.0e-8, 1.e3)
         return z_g, dNdz_g
+    
+    elif sample == 'lrg':
+        zmin, zmax, dNdz = np.loadtxt('/home/mehdi/data/rongpu/sv3_lrg_dndz_denali.txt', 
+                                      usecols=(0, 1, 2), unpack=True)        
+        zmid = 0.5*(zmin+zmax)
+        dNdz_interp = IUS(zmid, dNdz, ext=1)
+        dNdz_interp.set_smoothing_factor(2.0)
+
+
+        z_g = np.linspace(0.0, 5.0, 500)
+        dNdz_g = dNdz_interp(z_g)
+        return z_g, dNdz_g
+        
+    
     elif sample == 'mock':
         z = np.arange(0.0, 3.0, 0.001)
         i_lim = 26.                          # Limiting i-band magnitude
@@ -52,8 +66,23 @@ def dNdz_model(sample='qso', z_low=0.1, kind=1):
     else:
         raise NotImplemented(f'{sample}')
 
-
-def bias_model(z):
+def bias_model_lrg(z):
+    """ arxiv.org/abs/2001.06018
+    
+    """
+    kw_cosmo = dict(h=0.67556, T0_cmb=2.7255, Omega0_b=0.0482754208891869,
+                    Omega0_cdm=0.26377065934278865, N_ur=None, m_ncdm=[0.06],
+                    P_k_max=10.0, P_z_max=100.0, sigma8=0.8225, gauge='synchronous',
+                    n_s=0.9667, nonlinear=False)
+    sigma8 = kw_cosmo.pop('sigma8')            
+    cosmo = cosmology.Cosmology(**kw_cosmo).match(sigma8=sigma8) 
+    Dlin = cosmo.scale_independent_growth_factor       # D(z), normalized to one at z=0
+    
+    return 1.42/Dlin(z)
+    
+    
+    
+def bias_model_qso(z):
     """
      Bias of quasars Laurent et al. 2017 (1705.04718).
      TODO: Check the range in which this function is valid
@@ -63,12 +92,19 @@ def bias_model(z):
     return alpha * ((1+z)**2 - 6.565) + beta
 
 def init_sample(kind='qso', plot=False):
+    
     if kind=='qso':
         z, dNdz = dNdz_model(kind)
-        b = bias_model(z)
+        b = bias_model_qso(z)
+        
+    elif kind=='lrg':
+        z, dNdz = dNdz_model(kind)
+        b = bias_model_lrg(z)
+        
     elif kind=='mock':
         z, dNdz = dNdz_model(kind)
         b = 1.5*np.ones_like(z)
+        
     else:
         raise NotImplementedError(f'{kind} not implemented')
         
@@ -110,8 +146,12 @@ class Spectrum:
         DH = (cosmo.H0/cosmo.C) # in units of h/Mpc, eq. 4 https://arxiv.org/pdf/astro-ph/9905116.pdf
         Omega0_m = cosmo.Omega0_m
         
-        self.Plin = cosmology.LinearPower(cosmo, redshift, transfer='CLASS') # P(k) in (Mpc/h)^3       
-        self.Tlin = cosmology.transfers.CLASS(cosmo, redshift)  # T(k), normalized to one at k=0
+        k_ = np.logspace(-10, 10, 10000)
+        Plin_ = cosmology.LinearPower(cosmo, redshift, transfer='CLASS') # P(k) in (Mpc/h)^3 
+        self.Plin = IUS(k_, Plin_(k_), ext=1)
+        Tlin_ = cosmology.transfers.CLASS(cosmo, redshift)  # T(k), normalized to one at k=0
+        is_good = np.isfinite(Tlin_(k_))
+        self.Tlin = IUS(k_[is_good], Tlin_(k_)[is_good], ext=1)
         self.Dlin = cosmo.scale_independent_growth_factor       # D(z), normalized to one at z=0
         self.f = cosmo.scale_independent_growth_rate            # dlnD/dlna
         self.Dc = cosmo.comoving_distance              
@@ -133,6 +173,7 @@ class Spectrum:
         return self.__integrate_dk(fnl)
         
     def add_tracer(self, z, b, dNdz, p=1.6):
+        print(f'p = {p:.1f}')
         # dz/dr
         dNdr_spl = IUS(self.Dc(z), dNdz*self.h(z), ext=1) 
         dNdr_tot = romberg(dNdr_spl, self.Dc(z.min()), self.Dc(z.max()), divmax=1000)
@@ -153,9 +194,10 @@ class Spectrum:
         self.fr_wkfnl = lambda r: r * (b_spl(r)-p) * (dNdr_spl(r)/dNdr_tot) # Wfnl_ell:r*(b-p)*dN/dr   
         self.kernels_ready = False
 
-    def make_kernels(self, ell, logrmin=-10., logrmax=10., num=1000):
+    def make_kernels(self, ell, logrmin=-10., logrmax=10., num=10000):
         assert (ell[1:] > ell[:-1]).all(), "ell must be increasing"
-        kw_fft = dict(nu=1.01, N_extrap_low=0, N_extrap_high=0, c_window_width=0.25, N_pad=0)
+        kw_fft = dict(nu=1.01, N_extrap_low=0, N_extrap_high=0, 
+                      c_window_width=0.25, N_pad=0)
         
         r = np.logspace(logrmin, logrmax, num=num) # k = (ell+0.5) / r
         
@@ -195,6 +237,7 @@ class Spectrum:
             wk_rsd = self.wrk[i][1]
             wk_fnl = self.wfnlk[i][1]
 
+            #print(np.percentile(np.log10(k), [0, 100]))
             wk_t = wk_gg - wk_rsd + fnl*self.alpha_fnl*wk_fnl/(k*k*self.Tlin(k))
                         
             lnk = np.log(k)
